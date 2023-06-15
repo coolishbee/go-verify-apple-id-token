@@ -1,0 +1,1 @@
+# go-verify-apple-id-token
