@@ -4,6 +4,8 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -11,9 +13,11 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/mitchellh/mapstructure"
 )
 
-const APPLE_KEYS_URL = "https://appleid.apple.com/auth/keys"
+const APPLE_BASE_URL = "https://appleid.apple.com"
+const JWKS_APPLE_URI = "/auth/keys"
 
 // global cache for fast subsequent fetching
 var applePublicKeyObject map[string]*rsa.PublicKey
@@ -26,6 +30,20 @@ type AppleKey struct {
 	Alg string `json:"alg"`
 	N   string `json:"n"`
 	E   string `json:"e"`
+}
+
+type IdTokenResponse struct {
+	Aud            string `json:"aud"`
+	C_hash         string `mapstructure:"c_hash" json:"c_hash"`
+	Email          string `json:"email"`
+	EmailVerified  string `mapstructure:"email_verified" json:"email_verified"`
+	AuthTime       int64  `mapstructure:"auth_time" json:"auth_time"`
+	Exp            int64  `json:"exp"`
+	Iat            int64  `json:"iat"`
+	Iss            string `json:"iss"`
+	Nonce          string `json:"nonce"`
+	NonceSupported bool   `mapstructure:"nonce_supported" json:"nonce_supported"`
+	Sub            string `json:"sub"`
 }
 
 type Client struct {
@@ -43,26 +61,36 @@ func New() *Client {
 	return client
 }
 
-func (c *Client) VerifyIdToken(clientId, idToken string) error {
+func (c *Client) VerifyIdToken(clientId, idToken string) (*IdTokenResponse, error) {
+	jwtClaims := IdTokenResponse{}
 	tokenClaims, err := jwt.ParseWithClaims(idToken, &jwt.MapClaims{}, func(t *jwt.Token) (interface{}, error) {
-		log.Println(t.Header["kid"].(string))
-		log.Println(t.Header["alg"].(string))
+		//log.Println(t.Header["kid"].(string))
+		//log.Println(t.Header["alg"].(string))
 		kid := t.Header["kid"].(string)
 		alg := t.Header["alg"].(string)
 		return c.GetApplePublicKeyObject(kid, alg), nil
 	})
 
-	if tokenClaims != nil {
-
-		if claims, ok := tokenClaims.Claims.(*jwt.MapClaims); ok &&
-			claims.VerifyAudience(clientId, false) &&
-			claims.VerifyExpiresAt(time.Now().Unix(), false) &&
-			claims.VerifyIssuer("https://appleid.apple.com", false) {
-			return nil
-		}
+	err = mapstructure.Decode(tokenClaims.Claims, &jwtClaims)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	return err
+	// log.Printf("%t\n%#v", tokenClaims.Valid, tokenClaims.Claims)
+
+	if jwtClaims.Iss != APPLE_BASE_URL {
+		return nil, fmt.Errorf("The iss does not match the Apple URL - iss: %s | expected: %s", jwtClaims.Iss, APPLE_BASE_URL)
+	}
+	if jwtClaims.Aud != clientId {
+		return nil, fmt.Errorf("The aud parameter does not include this client - is: %s | expected: %s", jwtClaims.Aud, clientId)
+	}
+
+	expTime := time.UnixMilli(jwtClaims.Exp)
+	if time.Now().Before(expTime) {
+		return nil, errors.New("exp is earlier than the current time.")
+	}
+
+	return &jwtClaims, nil
 }
 
 // locally cache and get apple rsa.PublicKey object
@@ -122,11 +150,11 @@ func (c *Client) getApplePublicKeys() ([]AppleKey, error) {
 
 	//make http client
 	//c = http.Client{Timeout: 5 * time.Second}
-	req, err = http.NewRequest("GET", APPLE_KEYS_URL, nil)
+	req, err = http.NewRequest("GET", APPLE_BASE_URL+JWKS_APPLE_URI, nil)
 	if err != nil {
 		return nil, err
 	}
-
+	log.Println(req.URL)
 	//perform request
 	resp, err = c.httpCli.Do(req)
 	if err != nil {
